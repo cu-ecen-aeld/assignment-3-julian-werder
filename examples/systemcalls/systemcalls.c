@@ -1,4 +1,8 @@
 #include "systemcalls.h"
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 /**
  * @param cmd the command to execute with system()
@@ -9,15 +13,14 @@
 */
 bool do_system(const char *cmd)
 {
-
-/*
- * TODO  add your code here
- *  Call the system() function with the command set in the cmd
- *   and return a boolean true if the system() call completed with success
- *   or false() if it returned a failure
-*/
-
-    return true;
+    if(WIFEXITED(system(cmd)) && WEXITSTATUS(system(cmd)) == 0)
+    {
+        return true;
+    }
+    else
+    {
+        return false;
+    }
 }
 
 /**
@@ -58,7 +61,21 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
-
+    pid_t pid = fork();
+    if (pid == -1) {
+        return false; // Fork failed
+    } else if (pid == 0) {
+        execv(command[0], command);
+        exit(1);
+    } else {
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            return true; // Command executed successfully
+        } else {
+            return false; // Command failed
+        }
+    }
     va_end(args);
 
     return true;
@@ -85,13 +102,35 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     command[count] = command[count];
 
 
-/*
- * TODO
- *   Call execv, but first using https://stackoverflow.com/a/13784315/1446624 as a refernce,
- *   redirect standard out to a file specified by outputfile.
- *   The rest of the behaviour is same as do_exec()
- *
-*/
+    int fd = open(outputfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd == -1) {
+        va_end(args);
+        return false; // Failed to open output file
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(fd);
+        va_end(args);
+        return false; // Fork failed
+    } else if (pid == 0) {
+        if (dup2(fd, STDOUT_FILENO) == -1) {
+            exit(1);
+        }
+        close(fd);
+        execv(command[0], command);
+        exit(1);
+    } else {
+        close(fd);
+        int status;
+        waitpid(pid, &status, 0);
+        va_end(args);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            return true; // Command executed successfully
+        } else {
+            return false; // Command failed
+        }
+    }
 
     va_end(args);
 
