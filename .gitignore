@@ -7,5 +7,6 @@ aesd-build
 .vscode/
 test.sh.log
 .claude/
+aesdsocket
 server/aesdsocket
 server/valgrind-out.txt
