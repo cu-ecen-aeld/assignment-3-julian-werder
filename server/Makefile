@@ -1,4 +1,4 @@
-# Makefile for the assignment 5 "aesdsocket" server.
+# Makefile for the assignment 6 "aesdsocket" server (built by Buildroot or Yocto).
 #
 #   make                                         -> native build (uses gcc)
 #   make CROSS_COMPILE=aarch64-none-linux-gnu-   -> aarch64 cross build
@@ -17,8 +17,13 @@ ifeq ($(origin CC),default)
 CC = $(CROSS_COMPILE)gcc
 endif
 
-CFLAGS  ?= -g -Wall -Werror
+CFLAGS  ?= -g
 LDFLAGS ?=
+
+# Flags this program always needs; appended after any caller-supplied CFLAGS/LDFLAGS
+# (environment or command line), so overrides are honoured but cannot drop them.
+AESD_CFLAGS  = -Wall -Werror -pthread
+AESD_LDFLAGS = -pthread
 
 TARGET  = aesdsocket
 SRCS    = aesdsocket.c
@@ -27,7 +32,7 @@ SRCS    = aesdsocket.c
 all default: $(TARGET)
 
 $(TARGET): $(SRCS)
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(AESD_CFLAGS) $^ -o $@ $(LDFLAGS) $(AESD_LDFLAGS)
 
 clean:
 	rm -f $(TARGET) *.o
