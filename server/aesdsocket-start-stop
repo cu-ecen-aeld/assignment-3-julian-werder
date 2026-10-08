@@ -1,5 +1,5 @@
 #!/bin/sh
-# Init script for the aesdsocket server (assignment 5).
+# Init script for the aesdsocket server (assignments 5-6).
 # Installed by Buildroot as /etc/init.d/S99aesdsocket. "start" launches
 # aesdsocket in daemon mode; "stop" sends it SIGTERM so it cleans up and exits.
 
