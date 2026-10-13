@@ -29,9 +29,35 @@
 struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct aesd_circular_buffer *buffer,
             size_t char_offset, size_t *entry_offset_byte_rtn )
 {
-    /**
-    * TODO: implement per description
-    */
+    uint8_t index;
+    uint8_t count;
+    uint8_t valid_entries;
+
+    if (buffer == NULL || entry_offset_byte_rtn == NULL) {
+        return NULL;
+    }
+
+    /* A full buffer has in_offs == out_offs, so the count must be derived from the full flag */
+    if (buffer->full) {
+        valid_entries = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    } else {
+        valid_entries = (uint8_t)((buffer->in_offs + AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED - buffer->out_offs)
+                                  % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
+    }
+
+    index = buffer->out_offs;
+    for (count = 0; count < valid_entries; count++) {
+        struct aesd_buffer_entry *entry = &buffer->entry[index];
+
+        /* Subtract instead of keeping a running sum so the offset can never overflow */
+        if (char_offset < entry->size) {
+            *entry_offset_byte_rtn = char_offset;
+            return entry;
+        }
+        char_offset -= entry->size;
+        index = (uint8_t)((index + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
+    }
+
     return NULL;
 }
 
@@ -44,9 +70,19 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
 */
 void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry)
 {
-    /**
-    * TODO: implement per description
-    */
+    if (buffer == NULL || add_entry == NULL) {
+        return;
+    }
+
+    /* Copy by value: the caller's struct may live on its stack */
+    buffer->entry[buffer->in_offs] = *add_entry;
+
+    /* A write into a full buffer just replaced the oldest entry, so the oldest is now the next one */
+    if (buffer->full) {
+        buffer->out_offs = (uint8_t)((buffer->out_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
+    }
+    buffer->in_offs = (uint8_t)((buffer->in_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED);
+    buffer->full = (buffer->in_offs == buffer->out_offs);
 }
 
 /**
