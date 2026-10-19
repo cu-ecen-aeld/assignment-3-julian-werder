@@ -10,3 +10,12 @@ test.sh.log
 aesdsocket
 server/aesdsocket
 server/valgrind-out.txt
+# kbuild output (aesd-char-driver)
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
