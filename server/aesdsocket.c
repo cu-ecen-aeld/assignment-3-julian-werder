@@ -7,6 +7,17 @@
  * to that client. Each accepted connection is served by its own thread, so any
  * number of clients can be connected at once.
  *
+ * Two build modes, selected by USE_AESD_CHAR_DEVICE (default 1; the Makefile
+ * passes -DUSE_AESD_CHAR_DEVICE=0 or 1):
+ *   1  DATA_FILE is the /dev/aesdchar driver. It is opened without O_CREAT
+ *      and O_TRUNC, so a missing driver is an error and not a new regular
+ *      file in /dev. It is opened and closed for each packet append and each
+ *      read-back, so no descriptor is held while idle (the driver can then
+ *      be unloaded). There is no timestamp thread, no start-up create or
+ *      truncate and no removal on exit; the driver owns the data.
+ *   0  DATA_FILE is /var/tmp/aesdsocketdata, a regular file created on first
+ *      append, with the timestamp thread and removal on exit described below.
+ *
  * Usage: aesdsocket [-d]
  *   -d  run as a daemon. The socket is bound and listening before the fork,
  *       so the port is ready by the time the launching process returns.
@@ -18,17 +29,17 @@
  * fields of the per-connection bookkeeping and is never held across blocking
  * I/O or together with data_mutex.
  *
- * Timestamps: a separate thread appends a "timestamp:<RFC 2822 time>" line to
- * DATA_FILE every 10 seconds, measured on CLOCK_MONOTONIC from a fixed
- * deadline so the interval does not drift. The first stamp is written 10
- * seconds after start-up.
+ * Timestamps (mode 0 only): a separate thread appends a
+ * "timestamp:<RFC 2822 time>" line to DATA_FILE every 10 seconds, measured on
+ * CLOCK_MONOTONIC from a fixed deadline so the interval does not drift. The
+ * first stamp is written 10 seconds after start-up.
  *
  * Shutdown: SIGINT and SIGTERM request a graceful exit. The signal handler
  * shuts down the listening socket so accept() cannot miss the request. Only
  * the main thread handles signals (worker and timestamp threads start with
  * them blocked). On exit the main thread closes the listener, shuts down every
  * client socket so blocked threads wake up, stops the timestamp thread, joins
- * every thread and only then removes DATA_FILE.
+ * every thread and, in mode 0 only, removes DATA_FILE.
  *
  * DATA_FILE is never read into memory as a whole; it is streamed back to the
  * client in fixed-size chunks. Only the packet currently being received is
@@ -66,17 +77,28 @@
          (var) = (tvar))
 #endif
 
+/* Build-time switch: 1 stores packets in /dev/aesdchar, 0 in a regular file. */
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
 #define PORT 9000
+#if USE_AESD_CHAR_DEVICE
+#define DATA_FILE "/dev/aesdchar"
+#else
 #define DATA_FILE "/var/tmp/aesdsocketdata"
 #define DATA_FILE_MODE 0644
+#endif
 #define LISTEN_BACKLOG 10
 #define RX_CHUNK_SIZE 1024
 #define FILE_CHUNK_SIZE 1024
 #define PACKET_MIN_CAPACITY 1024
+#if !USE_AESD_CHAR_DEVICE
 #define TIMESTAMP_INTERVAL_SEC 10
 #define TIMESTAMP_FORMAT "%a, %d %b %Y %H:%M:%S %z"
 #define TIMESTAMP_PREFIX "timestamp:"
 #define TIMESTAMP_LINE_SIZE 128
+#endif
 
 /* Per-connection bookkeeping; the list is touched only by the main thread. */
 struct thread_node {
@@ -93,11 +115,13 @@ SLIST_HEAD(thread_list, thread_node);
 static pthread_mutex_t data_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Guards only node->client_fd and node->thread_complete. Never nested. */
 static pthread_mutex_t node_mutex = PTHREAD_MUTEX_INITIALIZER;
+#if !USE_AESD_CHAR_DEVICE
 /* ts_mutex, ts_cond and ts_stop only exist to wake the timestamp thread. */
 static pthread_mutex_t ts_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t ts_cond;
 static pthread_condattr_t ts_condattr;
 static bool ts_stop = false;
+#endif
 
 /* Set only by the signal handler; polled by the main and connection loops. */
 static volatile sig_atomic_t exit_requested = 0;
@@ -205,7 +229,12 @@ static int append_packet(const char *pkt, size_t len)
     int fd;
     int rc;
 
+#if USE_AESD_CHAR_DEVICE
+    /* The driver must already exist: never create a regular file in /dev. */
+    fd = open(DATA_FILE, O_WRONLY | O_APPEND);
+#else
     fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, DATA_FILE_MODE);
+#endif
     if (fd == -1) {
         syslog(LOG_ERR, "open %s for append failed: %s", DATA_FILE, strerror(errno));
         return -1;
@@ -465,6 +494,7 @@ static void *connection_thread(void *arg)
     return NULL;
 }
 
+#if !USE_AESD_CHAR_DEVICE
 /*
  * Append one "timestamp:<time>" line to DATA_FILE under data_mutex.
  * Returns 0 on success, -1 on failure (already logged).
@@ -554,6 +584,7 @@ static void *timestamp_thread(void *arg)
     (void)unlock_mutex(&ts_mutex);
     return NULL;
 }
+#endif
 
 /*
  * Join and free every completed node. A node that is not yet complete is never
@@ -643,6 +674,7 @@ static void close_listener(int sockfd)
     }
 }
 
+#if !USE_AESD_CHAR_DEVICE
 /*
  * Initialise ts_cond to wait on CLOCK_MONOTONIC (ts_condattr is kept for
  * destruction at exit). Returns 0 on success, -1 on failure (already logged).
@@ -666,13 +698,16 @@ static int init_timestamp_cond(void)
     }
     return 0;
 }
+#endif
 
-/* Destroy the condition variable, its attributes and the mutexes. */
+/* Destroy the condition variable (file mode only) and the mutexes. */
 static void destroy_sync_objects(void)
 {
+#if !USE_AESD_CHAR_DEVICE
     (void)pthread_cond_destroy(&ts_cond);
     (void)pthread_condattr_destroy(&ts_condattr);
     (void)pthread_mutex_destroy(&ts_mutex);
+#endif
     (void)pthread_mutex_destroy(&node_mutex);
     (void)pthread_mutex_destroy(&data_mutex);
 }
@@ -696,6 +731,7 @@ static void shutdown_clients(struct thread_list *list)
     (void)unlock_mutex(&node_mutex);
 }
 
+#if !USE_AESD_CHAR_DEVICE
 /* Tell the timestamp thread to stop and join it. Failures are logged. */
 static void stop_timestamp_thread(pthread_t thread)
 {
@@ -714,6 +750,7 @@ static void stop_timestamp_thread(pthread_t thread)
         syslog(LOG_ERR, "pthread_join timestamp thread failed: %s", strerror(rc));
     }
 }
+#endif
 
 /* Join and free every remaining node. Main thread only. */
 static void join_all_threads(struct thread_list *list)
@@ -760,7 +797,9 @@ int main(int argc, char *argv[])
     int reuse = 1;
     struct sockaddr_in addr;
     struct thread_list list = SLIST_HEAD_INITIALIZER(list);
+#if !USE_AESD_CHAR_DEVICE
     pthread_t ts_thread;
+#endif
 
     openlog("aesdsocket", LOG_PID, LOG_USER);
 
@@ -819,6 +858,7 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+#if !USE_AESD_CHAR_DEVICE
     if (init_timestamp_cond() != 0) {
         close_listener(sockfd);
         closelog();
@@ -831,6 +871,7 @@ int main(int argc, char *argv[])
         closelog();
         return -1;
     }
+#endif
 
     while (!exit_requested) {
         struct sockaddr_in client;
@@ -885,12 +926,16 @@ int main(int argc, char *argv[])
     syslog(LOG_INFO, "Caught signal, exiting");
     close_listener(sockfd);
     shutdown_clients(&list);
+#if !USE_AESD_CHAR_DEVICE
     stop_timestamp_thread(ts_thread);
+#endif
     join_all_threads(&list);
+#if !USE_AESD_CHAR_DEVICE
     /* Every thread is joined, so nothing can recreate the file. */
     if (unlink(DATA_FILE) != 0 && errno != ENOENT) {
         syslog(LOG_ERR, "unlink %s failed: %s", DATA_FILE, strerror(errno));
     }
+#endif
     destroy_sync_objects();
     closelog();
     return 0;

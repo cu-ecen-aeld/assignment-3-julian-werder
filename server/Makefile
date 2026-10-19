@@ -2,6 +2,7 @@
 #
 #   make                                         -> native build (uses gcc)
 #   make CROSS_COMPILE=aarch64-none-linux-gnu-   -> aarch64 cross build
+#   make USE_AESD_CHAR_DEVICE=0                  -> store data in a regular file instead of /dev/aesdchar
 #   make clean                                   -> remove aesdsocket and all .o files
 #
 # CROSS_COMPILE is prefixed onto the compiler name, so leaving it unset selects
@@ -20,9 +21,12 @@ endif
 CFLAGS  ?= -g
 LDFLAGS ?=
 
+# USE_AESD_CHAR_DEVICE=1 (default) stores data in /dev/aesdchar; 0 uses a regular file.
+USE_AESD_CHAR_DEVICE ?= 1
+
 # Flags this program always needs; appended after any caller-supplied CFLAGS/LDFLAGS
 # (environment or command line), so overrides are honoured but cannot drop them.
-AESD_CFLAGS  = -Wall -Werror -pthread
+AESD_CFLAGS  = -Wall -Werror -pthread -DUSE_AESD_CHAR_DEVICE=$(USE_AESD_CHAR_DEVICE)
 AESD_LDFLAGS = -pthread
 
 TARGET  = aesdsocket
