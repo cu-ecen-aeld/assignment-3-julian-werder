@@ -14,7 +14,14 @@
  *      file in /dev. It is opened and closed for each packet append and each
  *      read-back, so no descriptor is held while idle (the driver can then
  *      be unloaded). There is no timestamp thread, no start-up create or
- *      truncate and no removal on exit; the driver owns the data.
+ *      truncate and no removal on exit; the driver owns the data. A packet
+ *      that is exactly "AESDCHAR_IOCSEEKTO:X,Y" plus its newline, with X and Y
+ *      decimal numbers that fit in a uint32_t, is a seek command and is not
+ *      written to the driver. DATA_FILE is opened O_RDWR, the
+ *      AESDCHAR_IOCSEEKTO ioctl moves its file position to write command X,
+ *      offset Y, and the contents from that position to the end are sent back
+ *      to the client. A failed ioctl (for example an out-of-range seek) is
+ *      logged and nothing is sent; the connection stays up.
  *   0  DATA_FILE is /var/tmp/aesdsocketdata, a regular file created on first
  *      append, with the timestamp thread and removal on exit described below.
  *
@@ -42,12 +49,14 @@
  * every thread and, in mode 0 only, removes DATA_FILE.
  *
  * DATA_FILE is never read into memory as a whole; it is streamed back to the
- * client in fixed-size chunks. Only the packet currently being received is
- * kept on the heap, and a packet too large for available memory is discarded
- * (up to its terminating newline) without closing the connection.
+ * client in fixed-size chunks (in mode 0 the seek string is an ordinary
+ * packet). Only the packet currently being received is kept on the heap, and a
+ * packet too large for available memory is discarded (up to its terminating
+ * newline) without closing the connection.
  */
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -82,6 +91,10 @@
 #define USE_AESD_CHAR_DEVICE 1
 #endif
 
+#if USE_AESD_CHAR_DEVICE
+#include "../aesd-char-driver/aesd_ioctl.h"
+#endif
+
 #define PORT 9000
 #if USE_AESD_CHAR_DEVICE
 #define DATA_FILE "/dev/aesdchar"
@@ -93,7 +106,12 @@
 #define RX_CHUNK_SIZE 1024
 #define FILE_CHUNK_SIZE 1024
 #define PACKET_MIN_CAPACITY 1024
-#if !USE_AESD_CHAR_DEVICE
+#if USE_AESD_CHAR_DEVICE
+#define SEEK_CMD_PREFIX "AESDCHAR_IOCSEEKTO:"
+#define SEEK_CMD_PREFIX_LEN (sizeof(SEEK_CMD_PREFIX) - 1)
+#define SEEK_CMD_MIN_LEN (SEEK_CMD_PREFIX_LEN + 4) /* digit ',' digit '\n' */
+#define NUMBER_BASE 10
+#else
 #define TIMESTAMP_INTERVAL_SEC 10
 #define TIMESTAMP_FORMAT "%a, %d %b %Y %H:%M:%S %z"
 #define TIMESTAMP_PREFIX "timestamp:"
@@ -248,20 +266,16 @@ static int append_packet(const char *pkt, size_t len)
 }
 
 /*
- * Stream the whole of DATA_FILE to sockfd in FILE_CHUNK_SIZE pieces.
- * Returns 0 on success, -1 on failure.
+ * Read fd from its current position to end of file and send it all to sockfd
+ * in FILE_CHUNK_SIZE pieces. The descriptor is neither opened nor closed here.
+ * Returns 0 on success, -1 on failure (already logged, except for an exit
+ * request interrupting the read).
  */
-static int send_data_file(int sockfd)
+static int send_fd_contents(int sockfd, int fd)
 {
     char chunk[FILE_CHUNK_SIZE];
-    int fd;
     int rc = 0;
 
-    fd = open(DATA_FILE, O_RDONLY);
-    if (fd == -1) {
-        syslog(LOG_ERR, "open %s for read failed: %s", DATA_FILE, strerror(errno));
-        return -1;
-    }
     for (;;) {
         ssize_t n = read(fd, chunk, sizeof(chunk));
         if (n == 0) {
@@ -282,12 +296,117 @@ static int send_data_file(int sockfd)
             break;
         }
     }
+    return rc;
+}
+
+/*
+ * Stream the whole of DATA_FILE to sockfd in FILE_CHUNK_SIZE pieces.
+ * Returns 0 on success, -1 on failure (already logged, except for an exit
+ * request interrupting the read).
+ */
+static int send_data_file(int sockfd)
+{
+    int fd;
+    int rc;
+
+    fd = open(DATA_FILE, O_RDONLY);
+    if (fd == -1) {
+        syslog(LOG_ERR, "open %s for read failed: %s", DATA_FILE, strerror(errno));
+        return -1;
+    }
+    rc = send_fd_contents(sockfd, fd);
     if (close(fd) != 0) {
         syslog(LOG_ERR, "close %s after read failed: %s", DATA_FILE, strerror(errno));
         rc = -1;
     }
     return rc;
 }
+
+#if USE_AESD_CHAR_DEVICE
+/*
+ * Parse the decimal number at *p (which must start with a digit) into *value.
+ * The text is not NUL-terminated, so the caller guarantees that a non-digit
+ * byte follows the number inside the packet. On success *p is advanced past
+ * the digits. Returns true on success, false if the first byte is not a digit
+ * or the value does not fit in a uint32_t.
+ */
+static bool parse_seek_number(const char **p, uint32_t *value)
+{
+    unsigned long parsed;
+    char *end = NULL;
+
+    if (!isdigit((unsigned char)**p)) {
+        return false;
+    }
+    errno = 0;
+    parsed = strtoul(*p, &end, NUMBER_BASE);
+    if (end == *p || errno == ERANGE || parsed > UINT32_MAX) {
+        return false;
+    }
+    *value = (uint32_t)parsed;
+    *p = end;
+    return true;
+}
+
+/*
+ * Decide whether the len bytes of pkt are exactly
+ * "AESDCHAR_IOCSEEKTO:X,Y\n" with X and Y plain decimal digits that fit in a
+ * uint32_t. pkt always ends in its newline and holds no other newline, so
+ * strtoul stops at the ',' and at that newline and never reads past the packet.
+ * Returns true and fills *seekto if it is a seek command, false for anything
+ * else (a normal packet).
+ */
+static bool parse_seek_command(const char *pkt, size_t len, struct aesd_seekto *seekto)
+{
+    const char *p;
+
+    if (len < SEEK_CMD_MIN_LEN || pkt[len - 1] != '\n' ||
+        memcmp(pkt, SEEK_CMD_PREFIX, SEEK_CMD_PREFIX_LEN) != 0) {
+        return false;
+    }
+    p = pkt + SEEK_CMD_PREFIX_LEN;
+    if (!parse_seek_number(&p, &seekto->write_cmd) || *p != ',') {
+        return false;
+    }
+    p++;
+    if (!parse_seek_number(&p, &seekto->write_cmd_offset)) {
+        return false;
+    }
+    return p == pkt + len - 1;
+}
+
+/*
+ * Handle a seek command: open DATA_FILE O_RDWR, issue AESDCHAR_IOCSEEKTO and
+ * send everything from the new position to sockfd. Nothing is written to
+ * DATA_FILE. A failed ioctl is a client error (for example an out-of-range
+ * seek): it is logged, nothing is sent and 0 is returned so the connection
+ * stays up. Returns 0 on success or a handled ioctl failure, -1 on any other
+ * failure (already logged).
+ */
+static int seek_and_send(int sockfd, const struct aesd_seekto *seekto)
+{
+    int fd;
+    int rc;
+
+    fd = open(DATA_FILE, O_RDWR);
+    if (fd == -1) {
+        syslog(LOG_ERR, "open %s for seek failed: %s", DATA_FILE, strerror(errno));
+        return -1;
+    }
+    if (ioctl(fd, AESDCHAR_IOCSEEKTO, seekto) != 0) {
+        syslog(LOG_ERR, "seek to command %u offset %u on %s failed: %s", (unsigned int)seekto->write_cmd,
+               (unsigned int)seekto->write_cmd_offset, DATA_FILE, strerror(errno));
+        rc = 0;
+    } else {
+        rc = send_fd_contents(sockfd, fd);
+    }
+    if (close(fd) != 0) {
+        syslog(LOG_ERR, "close %s after seek failed: %s", DATA_FILE, strerror(errno));
+        rc = -1;
+    }
+    return rc;
+}
+#endif
 
 /*
  * Append n bytes of data to the heap packet buffer, growing it by doubling
@@ -390,16 +509,30 @@ static int create_thread(pthread_t *thread, void *(*fn)(void *), void *arg)
 
 /*
  * Append one packet to DATA_FILE and send the whole file back to sockfd, all
- * under data_mutex so the client gets a consistent snapshot. The mutex is
- * released on every path. Returns 0 on success, -1 on failure (logged).
+ * under data_mutex so the client gets a consistent snapshot. With
+ * USE_AESD_CHAR_DEVICE a seek command packet is not appended; instead the
+ * file is sent from the position it selects (see seek_and_send()). The mutex
+ * is released on every path. Returns 0 on success, -1 on failure (logged).
  */
 static int process_packet(int sockfd, const char *pkt, size_t len)
 {
     int rc;
+#if USE_AESD_CHAR_DEVICE
+    struct aesd_seekto seekto;
+#endif
 
     if (lock_mutex(&data_mutex) != 0) {
         return -1;
     }
+#if USE_AESD_CHAR_DEVICE
+    if (parse_seek_command(pkt, len, &seekto)) {
+        rc = seek_and_send(sockfd, &seekto);
+        if (unlock_mutex(&data_mutex) != 0) {
+            rc = -1;
+        }
+        return rc;
+    }
+#endif
     rc = append_packet(pkt, len);
     if (rc == 0) {
         rc = send_data_file(sockfd);
